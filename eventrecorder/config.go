@@ -26,6 +26,9 @@ import (
 // email_configs).  Every recorded event is fanned out to every output
 // across all lists.
 type Config struct {
+	// Spool enables durable on-disk buffering for file and webhook
+	// outputs when its Path is non-empty.
+	Spool          SpoolConfig           `yaml:"spool,omitempty" json:"spool,omitempty"`
 	FileOutputs    []FileOutputConfig    `yaml:"file_outputs,omitempty" json:"file_outputs,omitempty"`
 	WebhookOutputs []WebhookOutputConfig `yaml:"webhook_outputs,omitempty" json:"webhook_outputs,omitempty"`
 	KafkaOutputs   []KafkaOutputConfig   `yaml:"kafka_outputs,omitempty" json:"kafka_outputs,omitempty"`
@@ -43,6 +46,20 @@ func (c *Config) UnmarshalYAML(unmarshal func(any) error) error {
 }
 
 func (c Config) validate() error {
+	if err := c.Spool.validate(); err != nil {
+		return err
+	}
+	// Batching assembles JSON arrays in memory with timer-driven
+	// flushes, so its events cannot be acknowledged individually.
+	// Durable spooling requires per-event frames and acknowledgements,
+	// and mixing the two would silently change the endpoint contract.
+	if c.Spool.enabled() {
+		for _, out := range c.WebhookOutputs {
+			if out.Batch {
+				return fmt.Errorf("event_recorder webhook output %q cannot enable batching while disk spool is enabled", out.Name)
+			}
+		}
+	}
 	seen := make(map[string]struct{}, c.totalOutputs())
 	add := func(kind, name string) error {
 		id, err := outputIdentifier(kind, name)
@@ -107,7 +124,8 @@ func (c Config) totalOutputs() int {
 // the type's equal helper (defined alongside that output's
 // implementation in file.go, webhook.go, kafka.go).
 func configEqual(a, b Config) bool {
-	if len(a.FileOutputs) != len(b.FileOutputs) ||
+	if !a.Spool.equal(b.Spool) ||
+		len(a.FileOutputs) != len(b.FileOutputs) ||
 		len(a.WebhookOutputs) != len(b.WebhookOutputs) ||
 		len(a.KafkaOutputs) != len(b.KafkaOutputs) ||
 		len(a.StdoutOutputs) != len(b.StdoutOutputs) {

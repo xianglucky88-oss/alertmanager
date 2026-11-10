@@ -53,29 +53,24 @@ func (c FileOutputConfig) equal(o FileOutputConfig) bool {
 	return c.Name == o.Name && c.Path == o.Path
 }
 
-// FileOutput writes pre-serialized JSON event bytes to a JSONL file.
-// The file is reopened when fsnotify detects a rename or remove (e.g.
-// logrotate).
-type FileOutput struct {
-	path   string
-	name   string
-	mu     sync.Mutex
-	f      *os.File
-	closed bool
-	logger *slog.Logger
-	done   chan struct{}
-	wg     sync.WaitGroup
+// fileSink owns the JSONL target file and its logrotation watcher. It
+// implements spoolSink so both the direct FileOutput and the durable
+// spooled output write the exact same bytes to the same file format.
+type fileSink struct {
+	path      string
+	name      string
+	mu        sync.Mutex
+	f         *os.File
+	closed    bool
+	logger    *slog.Logger
+	done      chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup
 }
 
-// Name returns a stable identifier for this output.
-func (fo *FileOutput) Name() string {
-	return fo.name
-}
-
-// NewFileOutput creates a new file-based event recorder output. The file is
-// watched with fsnotify so that external log
-// rotation tools (e.g., logrotate) trigger an immediate reopen.
-func NewFileOutput(cfg FileOutputConfig, logger *slog.Logger) (*FileOutput, error) {
+// newFileSink opens the target file (creating it if absent) and starts
+// watching its parent directory for external rotation.
+func newFileSink(cfg FileOutputConfig, logger *slog.Logger) (*fileSink, error) {
 	name, err := outputIdentifier("file", cfg.Name)
 	if err != nil {
 		return nil, err
@@ -88,7 +83,7 @@ func NewFileOutput(cfg FileOutputConfig, logger *slog.Logger) (*FileOutput, erro
 		return nil, err
 	}
 
-	fo := &FileOutput{
+	sink := &fileSink{
 		path:   cfg.Path,
 		name:   name,
 		f:      f,
@@ -97,39 +92,79 @@ func NewFileOutput(cfg FileOutputConfig, logger *slog.Logger) (*FileOutput, erro
 	}
 
 	ready := make(chan error, 1)
-	fo.wg.Add(1)
-	go fo.watchLoop(ready)
+	sink.wg.Add(1)
+	go sink.watchLoop(ready)
 	if err := <-ready; err != nil {
 		f.Close()
 		return nil, fmt.Errorf("starting file watcher: %w", err)
 	}
-	return fo, nil
+	return sink, nil
+}
+
+// Name returns a stable identifier for this sink.
+func (s *fileSink) Name() string {
+	return s.name
+}
+
+// encode serializes the event as the JSONL bytes written to the target
+// file: one protojson object followed by a trailing newline.
+func (s *fileSink) encode(event Event) ([]byte, error) {
+	data, err := event.MarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
+}
+
+// write appends pre-encoded JSONL bytes to the target file.
+func (s *fileSink) write(payload []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("file event recorder output is closed")
+	}
+	_, err := s.f.Write(payload)
+	return err
+}
+
+// Close stops the watcher goroutine, waits for it to exit, and closes
+// the file. It is safe to call more than once.
+func (s *fileSink) Close() error {
+	s.closeOnce.Do(func() { close(s.done) })
+	s.wg.Wait()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	return s.f.Close()
 }
 
 func openAppend(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 }
 
-func (fo *FileOutput) reopen() {
-	fo.mu.Lock()
-	defer fo.mu.Unlock()
+func (s *fileSink) reopen() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	if fo.closed {
+	if s.closed {
 		return
 	}
-	if fo.f != nil {
-		fo.f.Close()
+	if s.f != nil {
+		s.f.Close()
 	}
-	f, err := openAppend(fo.path)
+	f, err := openAppend(s.path)
 	if err != nil {
-		fo.logger.Error("Failed to reopen event recorder file", "output", fo.name, "path", fo.path, "err", err)
+		s.logger.Error("Failed to reopen event recorder file", "output", s.name, "path", s.path, "err", err)
 		return
 	}
-	fo.f = f
+	s.f = f
 }
 
-func (fo *FileOutput) watchLoop(ready chan<- error) {
-	defer fo.wg.Done()
+func (s *fileSink) watchLoop(ready chan<- error) {
+	defer s.wg.Done()
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -142,15 +177,15 @@ func (fo *FileOutput) watchLoop(ready chan<- error) {
 	// When logrotate renames the file, an inode-level watch is
 	// lost with the old inode.  A directory watch reliably
 	// delivers Rename/Remove/Create events for the target path.
-	dir := filepath.Dir(fo.path)
+	dir := filepath.Dir(s.path)
 	if err := watcher.Add(dir); err != nil {
 		ready <- fmt.Errorf("watching directory %s: %w", dir, err)
 		return
 	}
 
-	absPath, err := filepath.Abs(fo.path)
+	absPath, err := filepath.Abs(s.path)
 	if err != nil {
-		ready <- fmt.Errorf("resolving absolute path for %s: %w", fo.path, err)
+		ready <- fmt.Errorf("resolving absolute path for %s: %w", s.path, err)
 		return
 	}
 
@@ -168,42 +203,58 @@ func (fo *FileOutput) watchLoop(ready chan<- error) {
 				continue
 			}
 			if event.Op&(fsnotify.Rename|fsnotify.Remove|fsnotify.Create) != 0 {
-				fo.reopen()
+				s.reopen()
 			}
 		case err, ok := <-watcher.Errors:
 			if !ok {
 				return
 			}
-			fo.logger.Error("fsnotify error on event recorder directory", "output", fo.name, "path", fo.path, "err", err)
-		case <-fo.done:
+			s.logger.Error("fsnotify error on event recorder directory", "output", s.name, "path", s.path, "err", err)
+		case <-s.done:
 			return
 		}
 	}
+}
+
+// FileOutput writes pre-serialized JSON event bytes to a JSONL file.
+// The file is reopened when fsnotify detects a rename or remove (e.g.
+// logrotate).
+type FileOutput struct {
+	sink *fileSink
+}
+
+// NewFileOutput creates a new file-based event recorder output. The file is
+// watched with fsnotify so that external log
+// rotation tools (e.g., logrotate) trigger an immediate reopen.
+func NewFileOutput(cfg FileOutputConfig, logger *slog.Logger) (*FileOutput, error) {
+	sink, err := newFileSink(cfg, logger)
+	if err != nil {
+		return nil, err
+	}
+	return &FileOutput{sink: sink}, nil
+}
+
+// Name returns a stable identifier for this output.
+func (fo *FileOutput) Name() string {
+	return fo.sink.Name()
 }
 
 // SendEvent serializes the event as a JSON line and appends it to the
 // file.  It returns the number of bytes written (including the trailing
 // newline) for the bytes-written metric.
 func (fo *FileOutput) SendEvent(event Event) (int, error) {
-	data, err := event.MarshalJSON()
+	data, err := fo.sink.encode(event)
 	if err != nil {
 		return 0, &serializeError{err: err}
 	}
-	data = append(data, '\n')
-
-	fo.mu.Lock()
-	defer fo.mu.Unlock()
-	n, err := fo.f.Write(data)
-	return n, err
+	if err := fo.sink.write(data); err != nil {
+		return 0, err
+	}
+	return len(data), nil
 }
 
 // Close stops the watcher goroutine, waits for it to exit, and closes
 // the file.
 func (fo *FileOutput) Close() error {
-	close(fo.done)
-	fo.wg.Wait()
-	fo.mu.Lock()
-	defer fo.mu.Unlock()
-	fo.closed = true
-	return fo.f.Close()
+	return fo.sink.Close()
 }

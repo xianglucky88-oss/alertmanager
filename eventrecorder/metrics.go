@@ -26,6 +26,10 @@ type metrics struct {
 	eventSerializeErrors      *prometheus.CounterVec
 	outputDrops               *prometheus.CounterVec
 	kafkaProduceErrors        *prometheus.CounterVec
+	spoolBytes                *prometheus.GaugeVec
+	spoolEvents               *prometheus.GaugeVec
+	spoolEnqueueErrors        *prometheus.CounterVec
+	spoolDeliveryErrors       *prometheus.CounterVec
 }
 
 // newMetrics builds and (if r is non-nil) registers every metric the
@@ -66,9 +70,30 @@ func newMetrics(r prometheus.Registerer) *metrics {
 		Help: "The total number of Kafka produce attempts that failed.",
 	}, []string{"output", "error_type"})
 
+	spoolBytes := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "alertmanager_event_spool_bytes",
+		Help: "The current on-disk size of an event recorder spool in bytes.",
+	}, []string{"output"})
+
+	spoolEvents := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "alertmanager_event_spool_events",
+		Help: "The current number of unacknowledged events buffered in an event recorder spool.",
+	}, []string{"output"})
+
+	spoolEnqueueErrors := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "alertmanager_event_spool_enqueue_errors_total",
+		Help: "The total number of events that could not be written to an event recorder spool.",
+	}, []string{"output", "reason"})
+
+	spoolDeliveryErrors := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "alertmanager_event_spool_delivery_errors_total",
+		Help: "The total number of failed delivery attempts against a spooled event recorder output.",
+	}, []string{"output"})
+
 	if r != nil {
 		r.MustRegister(eventsRecorded, eventRecorderBytesWritten, eventsDropped,
-			eventSerializeErrors, outputDrops, kafkaProduceErrors)
+			eventSerializeErrors, outputDrops, kafkaProduceErrors,
+			spoolBytes, spoolEvents, spoolEnqueueErrors, spoolDeliveryErrors)
 	}
 
 	return &metrics{
@@ -78,5 +103,9 @@ func newMetrics(r prometheus.Registerer) *metrics {
 		eventSerializeErrors:      eventSerializeErrors,
 		outputDrops:               outputDrops,
 		kafkaProduceErrors:        kafkaProduceErrors,
+		spoolBytes:                spoolBytes,
+		spoolEvents:               spoolEvents,
+		spoolEnqueueErrors:        spoolEnqueueErrors,
+		spoolDeliveryErrors:       spoolDeliveryErrors,
 	}
 }

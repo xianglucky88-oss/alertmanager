@@ -429,9 +429,16 @@ func (wo *WebhookOutput) postWithRetry(data []byte) {
 }
 
 func (wo *WebhookOutput) post(data []byte) error {
-	resp, err := wo.client.Post(wo.url, "application/json", bytes.NewReader(data))
+	return postWebhookEvent(wo.client, wo.url, wo.kind, data)
+}
+
+// postWebhookEvent performs a single POST of an already-encoded JSON
+// payload. It is shared by the queued WebhookOutput and the durable
+// webhookSink, which need byte-identical on-the-wire behavior.
+func postWebhookEvent(client *http.Client, url, kind string, data []byte) error {
+	resp, err := client.Post(url, "application/json", bytes.NewReader(data))
 	if err != nil {
-		return fmt.Errorf("event recorder %s POST failed: %w", wo.kind, err)
+		return fmt.Errorf("event recorder %s POST failed: %w", kind, err)
 	}
 	defer func() {
 		io.Copy(io.Discard, resp.Body)
@@ -439,8 +446,74 @@ func (wo *WebhookOutput) post(data []byte) error {
 	}()
 
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("event recorder %s returned HTTP %d", wo.kind, resp.StatusCode)
+		return fmt.Errorf("event recorder %s returned HTTP %d", kind, resp.StatusCode)
 	}
+	return nil
+}
+
+// webhookSink performs single-event, single-attempt HTTP delivery for
+// the durable disk spool. It deliberately has no worker pool or
+// in-memory queue: the spooled output's flush loop owns ordering and
+// retries, and an event is acknowledged only after a successful POST.
+type webhookSink struct {
+	client *http.Client
+	url    string
+	name   string
+	kind   string
+	logger *slog.Logger
+}
+
+// newWebhookSink builds a webhook sink used behind a disk spool.
+func newWebhookSink(cfg WebhookOutputConfig, logger *slog.Logger) (*webhookSink, error) {
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	httpCfg := commoncfg.DefaultHTTPClientConfig
+	if cfg.HTTPConfig != nil {
+		httpCfg = *cfg.HTTPConfig
+	}
+
+	client, err := commoncfg.NewClientFromConfig(httpCfg, "eventrecorder")
+	if err != nil {
+		return nil, fmt.Errorf("creating HTTP client for event recorder webhook: %w", err)
+	}
+
+	timeout := defaultWebhookTimeout
+	if cfg.Timeout > 0 {
+		timeout = time.Duration(cfg.Timeout)
+	}
+	client.Timeout = timeout
+
+	name, err := outputIdentifier("webhook", cfg.Name)
+	if err != nil {
+		return nil, err
+	}
+	return &webhookSink{
+		client: client,
+		url:    cfg.URL.String(),
+		name:   name,
+		kind:   "webhook",
+		logger: logger,
+	}, nil
+}
+
+// Name returns the stable identifier for this sink.
+func (s *webhookSink) Name() string { return s.name }
+
+// encode serializes the event as the JSON body posted to the webhook.
+func (s *webhookSink) encode(event Event) ([]byte, error) {
+	return event.MarshalJSON()
+}
+
+// write makes one delivery attempt and returns the error without
+// dropping the payload; the caller retries through the spool.
+func (s *webhookSink) write(payload []byte) error {
+	return postWebhookEvent(s.client, s.url, s.kind, payload)
+}
+
+// Close releases idle connections owned by the HTTP client.
+func (s *webhookSink) Close() error {
+	s.client.CloseIdleConnections()
 	return nil
 }
 

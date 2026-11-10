@@ -19,6 +19,13 @@
 // placed on a bounded in-memory queue.  A background goroutine
 // drains the queue and sends to destinations.  If the queue is full,
 // events are dropped and a metric is incremented.
+//
+// When a spool path is configured, file and webhook destinations are
+// wrapped in a durable on-disk queue instead: events are appended to
+// disk in recording order, delivered in order by a single flusher,
+// and acknowledged only after successful delivery.  A restart or
+// configuration reload therefore resumes strictly after the last
+// confirmed event without replaying confirmed events.
 package eventrecorder
 
 import (
@@ -167,6 +174,9 @@ func NewRecorderFromConfig(cfg Config, instance string, logger *slog.Logger, r p
 }
 
 // buildOutputs creates Destination implementations from the given config.
+// When a spool path is configured, file and webhook outputs are wrapped
+// in durable spooled destinations; their spools are opened later by
+// startDestinations, after any previous owner has released them.
 func buildOutputs(cfg Config, instance string, m *metrics, logger *slog.Logger) []Destination {
 	if err := cfg.validate(); err != nil {
 		logger.Error("Invalid event recorder output configuration")
@@ -174,6 +184,21 @@ func buildOutputs(cfg Config, instance string, m *metrics, logger *slog.Logger) 
 	}
 	var outputs []Destination
 	for _, fc := range cfg.FileOutputs {
+		if cfg.Spool.enabled() {
+			sink, err := newFileSink(fc, logger)
+			if err != nil {
+				logger.Error("Failed to create file event recorder output", "output", safeOutputIdentifier("file", fc.Name), "path", fc.Path, "err", err)
+				continue
+			}
+			out, err := newSpooledOutput(sink, cfg.Spool.Path, cfg.Spool, m, logger)
+			if err != nil {
+				logger.Error("Failed to create spooled file event recorder output", "output", safeOutputIdentifier("file", fc.Name), "err", err)
+				_ = sink.Close()
+				continue
+			}
+			outputs = append(outputs, out)
+			continue
+		}
 		fo, err := NewFileOutput(fc, logger)
 		if err != nil {
 			logger.Error("Failed to create file event recorder output", "output", safeOutputIdentifier("file", fc.Name), "path", fc.Path, "err", err)
@@ -182,6 +207,21 @@ func buildOutputs(cfg Config, instance string, m *metrics, logger *slog.Logger) 
 		outputs = append(outputs, fo)
 	}
 	for _, wc := range cfg.WebhookOutputs {
+		if cfg.Spool.enabled() {
+			sink, err := newWebhookSink(wc, logger)
+			if err != nil {
+				logger.Error("Failed to create webhook event recorder output", "output", safeOutputIdentifier("webhook", wc.Name))
+				continue
+			}
+			out, err := newSpooledOutput(sink, cfg.Spool.Path, cfg.Spool, m, logger)
+			if err != nil {
+				logger.Error("Failed to create spooled webhook event recorder output", "output", safeOutputIdentifier("webhook", wc.Name), "err", err)
+				_ = sink.Close()
+				continue
+			}
+			outputs = append(outputs, out)
+			continue
+		}
 		wo, err := NewWebhookOutput(wc, m.outputDrops, logger)
 		if err != nil {
 			logger.Error("Failed to create webhook event recorder output", "output", safeOutputIdentifier("webhook", wc.Name))
@@ -208,6 +248,28 @@ func buildOutputs(cfg Config, instance string, m *metrics, logger *slog.Logger) 
 	return outputs
 }
 
+// startedDestination is implemented by outputs whose construction is
+// two-phase: buildOutputs creates them, but resources that must be
+// uniquely owned (a disk spool directory) are acquired in start after
+// any previous owner has been closed.
+type startedDestination interface {
+	start() error
+}
+
+// startDestinations opens lazy resources and starts background loops
+// for every output that needs it.
+func startDestinations(outputs []Destination, logger *slog.Logger) {
+	for _, out := range outputs {
+		started, ok := out.(startedDestination)
+		if !ok {
+			continue
+		}
+		if err := started.start(); err != nil {
+			logger.Error("Failed to start event recorder output", "output", out.Name(), "err", err)
+		}
+	}
+}
+
 // writeLoop drains the event queue, serializes events, and writes to
 // outputs.  It owns the outputs and currentCfg exclusively — all
 // mutations arrive via the cfgUpdate channel, so no mutex is needed.
@@ -219,6 +281,7 @@ func buildOutputs(cfg Config, instance string, m *metrics, logger *slog.Logger) 
 // events and closes all outputs before returning.
 func (c *sharedRecorder) writeLoop(outputs []Destination, currentCfg Config) {
 	defer c.wg.Done()
+	startDestinations(outputs, c.logger)
 	defer func() {
 		for _, out := range outputs {
 			if err := out.Close(); err != nil && c.logger != nil {
@@ -249,11 +312,15 @@ func (c *sharedRecorder) writeLoop(outputs []Destination, currentCfg Config) {
 				oldOutputs := outputs
 				outputs = newOutputs
 				currentCfg = update.cfg
+				// Close the old outputs before opening spool directories
+				// on the new ones: two flushers must never own the same
+				// on-disk queue, or an event could be delivered twice.
 				for _, out := range oldOutputs {
 					if err := out.Close(); err != nil {
 						c.logger.Error("Failed to close old event recorder output", "output", out.Name())
 					}
 				}
+				startDestinations(newOutputs, c.logger)
 				c.logger.Info("Event recorder configuration reloaded", "outputs", len(outputs))
 			}
 			close(update.done)

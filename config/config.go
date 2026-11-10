@@ -238,6 +238,7 @@ func resolveFilepaths(baseDir string, cfg *Config) {
 		}
 	}
 
+	cfg.EventRecorder.Spool.Path = join(cfg.EventRecorder.Spool.Path)
 	for i := range cfg.EventRecorder.FileOutputs {
 		cfg.EventRecorder.FileOutputs[i].Path = join(cfg.EventRecorder.FileOutputs[i].Path)
 	}

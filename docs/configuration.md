@@ -2212,6 +2212,11 @@ troubleshooting. Names must be non-empty, valid UTF-8, and unique within each
 output type.
 
 ```yaml
+# Durable on-disk buffering for file and webhook outputs. When omitted,
+# outputs keep their bounded in-memory queue behavior.
+spool:
+  [ - <spool_config> ... ]
+
 # JSONL file outputs.
 file_outputs:
   [ - <file_output> ... ]
@@ -2234,6 +2239,53 @@ Alert labels, alert annotations, group labels, silence annotations, and
 muted-alert labels are encoded as maps. Protobuf consumers must use the Go
 package `github.com/prometheus/alertmanager/eventrecorder/events/v2` or bindings
 generated from that schema.
+
+#### `<spool_config>`
+
+Configures recoverable disk buffering for `file_outputs` and
+`webhook_outputs`. When `path` is set, every file and webhook output is
+backed by its own append-only spool directory under that path (named after
+the stable output identifier, e.g. `webhook:primary`). Kafka and stdout
+outputs are not spooled.
+
+Events are encoded with the destination's normal wire format — a JSON line
+for file outputs and a JSON request body for webhooks — and appended to disk
+in recording order before they are delivered. A single flusher goroutine per
+output delivers one frame at a time, in order, and advances a durably stored
+commit position only after the destination acknowledges the write. On process
+restart or configuration reload, delivery resumes strictly after the last
+confirmed event: confirmed events are never replayed, while unconfirmed
+events remain buffered and are retried. Delivery is at-least-once: a crash
+between a successful destination write and the commit update can redeliver
+that single in-flight event, so receivers that need exactly-once semantics
+should deduplicate by event ID.
+
+Frames carry a length prefix and CRC32 checksum, so a partial write caused by
+a crash or a full disk is detected and truncated on the next open without
+affecting earlier records. Encoding errors are rejected before anything is
+written. When the spool reaches `max_size`, new events are rejected and
+counted rather than overwriting or blocking existing buffered events. A
+spooled webhook output cannot use `batch: true`, because batched requests are
+assembled in memory and cannot be acknowledged per event.
+
+```yaml
+# Root directory for per-output spool directories. Relative paths are
+# resolved against the configuration file directory.
+path: <filepath>
+
+# Maximum size in bytes that one output's spool directory may occupy.
+# Events that would exceed the limit are dropped and counted.
+[ max_size: <int> | default = 104857600 ]
+```
+
+The following metrics observe spool behavior:
+
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `alertmanager_event_spool_bytes` | `output` | Current on-disk spool size in bytes. |
+| `alertmanager_event_spool_events` | `output` | Number of unacknowledged buffered events. |
+| `alertmanager_event_spool_enqueue_errors_total` | `output`, `reason` | Events that could not be spooled (`full` or `disk`). |
+| `alertmanager_event_spool_delivery_errors_total` | `output` | Failed delivery attempts; the event stays buffered and is retried. |
 
 #### `<file_output>`
 
@@ -2258,6 +2310,12 @@ backoff.
 Retries resend the entire event or batch, so receivers should tolerate
 duplicate events after ambiguous failures. With multiple workers, requests
 may complete out of order; set `workers: 1` when request ordering matters.
+
+When a `spool` path is configured, webhook outputs instead use the durable
+single-flight delivery loop described under [`<spool_config>`](#spool_config):
+events are posted individually in recording order with unbounded retries
+until the endpoint recovers, and `workers`, `max_retries`, `retry_backoff`
+and `batch` are not applicable.
 
 ```yaml
 # Name used to identify this output in metrics and logs.

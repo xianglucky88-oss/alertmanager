@@ -72,6 +72,49 @@ event_recorder:
 	require.Equal(t, "/etc/alertmanager/pipeline-token", auth.CredentialsFile)
 }
 
+func TestEventRecorderSpoolConfig(t *testing.T) {
+	cfg, err := Load(`
+route:
+  receiver: default
+receivers:
+- name: default
+event_recorder:
+  spool:
+    path: spool/eventrecorder
+    max_size: 4096
+  file_outputs:
+  - name: archive
+    path: events.jsonl
+  webhook_outputs:
+  - name: pipelines
+    url: https://example.com/ingest
+`)
+	require.NoError(t, err)
+	require.Equal(t, "spool/eventrecorder", cfg.EventRecorder.Spool.Path)
+	require.Equal(t, int64(4096), cfg.EventRecorder.Spool.MaxSize)
+
+	resolveFilepaths("/etc/alertmanager", cfg)
+	require.Equal(t, "/etc/alertmanager/spool/eventrecorder", cfg.EventRecorder.Spool.Path)
+	require.Equal(t, "/etc/alertmanager/events.jsonl", cfg.EventRecorder.FileOutputs[0].Path)
+}
+
+func TestEventRecorderSpoolRejectsBatching(t *testing.T) {
+	_, err := Load(`
+route:
+  receiver: default
+receivers:
+- name: default
+event_recorder:
+  spool:
+    path: /var/spool/alertmanager
+  webhook_outputs:
+  - name: pipelines
+    url: https://example.com/ingest
+    batch: true
+`)
+	require.ErrorContains(t, err, "batching")
+}
+
 func TestDefaultReceiverExists(t *testing.T) {
 	in := `
 route:
