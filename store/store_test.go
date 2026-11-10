@@ -174,3 +174,184 @@ func TestGC(t *testing.T) {
 	}
 	require.Len(t, resolved, n)
 }
+
+func newLimitedAlert(t *testing.T, instance string, start, end time.Time) *alert.Alert {
+	t.Helper()
+	return alert.New(model.Alert{
+		Labels: model.LabelSet{
+			model.AlertNameLabel: "TestAlert",
+			"instance":           model.LabelValue(instance),
+		},
+		StartsAt: start,
+		EndsAt:   end,
+	}, start, false)
+}
+
+func TestSetPendingWithoutLimit(t *testing.T) {
+	// With no limit configured every alert is admitted, so the overflow
+	// queue stays empty and the legacy behavior is preserved.
+	s := NewAlerts()
+	now := time.Now()
+	alrt := newLimitedAlert(t, "a", now, now.Add(time.Hour))
+
+	require.NoError(t, s.Set(alrt))
+	require.Equal(t, 0, s.PendingLen())
+
+	s.SetPending(alrt, now)
+	require.Equal(t, 1, s.PendingLen())
+	admitted := s.PromotePending(now)
+	require.Len(t, admitted, 1)
+	require.Equal(t, alrt.Fingerprint(), admitted[0].Fingerprint())
+	require.Equal(t, 0, s.PendingLen())
+}
+
+func TestPendingReconciliationStableOrder(t *testing.T) {
+	now := time.Now()
+	s := NewAlerts().WithPerAlertLimit(2)
+
+	// The two admitted instances occupy the full capacity and expire shortly
+	// after the test starts.
+	active1 := newLimitedAlert(t, "active1", now, now.Add(300*time.Millisecond))
+	active2 := newLimitedAlert(t, "active2", now, now.Add(300*time.Millisecond))
+	require.NoError(t, s.Set(active1))
+	require.NoError(t, s.Set(active2))
+
+	// The first two queued instances outlive the first reconciliation round;
+	// the third stays fresh for the second round.
+	first := newLimitedAlert(t, "first", now, now.Add(1200*time.Millisecond))
+	second := newLimitedAlert(t, "second", now, now.Add(1200*time.Millisecond))
+	third := newLimitedAlert(t, "third", now, now.Add(time.Hour))
+
+	require.ErrorIs(t, s.Set(first), ErrLimited)
+	require.ErrorIs(t, s.Set(second), ErrLimited)
+	require.ErrorIs(t, s.Set(third), ErrLimited)
+
+	// Queue entries in reverse arrival order to prove that ordering follows
+	// the firstSeen timestamp rather than map iteration or insertion order.
+	s.SetPending(third, now.Add(3*time.Second))
+	s.SetPending(second, now.Add(2*time.Second))
+	s.SetPending(first, now.Add(1*time.Second))
+	require.Equal(t, 3, s.PendingLen())
+
+	// While the capacity is occupied nothing can be admitted.
+	require.Empty(t, s.PromotePending(now))
+	require.Equal(t, 3, s.PendingLen())
+
+	// After the active instances expire, the two oldest queued instances are
+	// admitted in first-in-first-out order; the third must keep waiting.
+	time.Sleep(400 * time.Millisecond)
+	require.Equal(t, []model.Fingerprint{first.Fingerprint(), second.Fingerprint()}, fps(s.PromotePending(time.Now())))
+	require.Equal(t, 1, s.PendingLen())
+	if _, err := s.Get(first.Fingerprint()); err != nil {
+		t.Fatalf("first alert should have been admitted: %v", err)
+	}
+	if _, err := s.Get(second.Fingerprint()); err != nil {
+		t.Fatalf("second alert should have been admitted: %v", err)
+	}
+
+	// Once the previously admitted instances expire too, the last queued
+	// instance is admitted rather than being lost.
+	time.Sleep(1100 * time.Millisecond)
+	require.Equal(t, []model.Fingerprint{third.Fingerprint()}, fps(s.PromotePending(time.Now())))
+	require.Equal(t, 0, s.PendingLen())
+}
+
+func TestPendingRepeatedReportsKeepPositionAndState(t *testing.T) {
+	now := time.Now()
+	s := NewAlerts().WithPerAlertLimit(1)
+
+	active := newLimitedAlert(t, "active", now, now.Add(time.Hour))
+	require.NoError(t, s.Set(active))
+
+	queued := newLimitedAlert(t, "queued", now, now.Add(time.Hour))
+	require.ErrorIs(t, s.Set(queued), ErrLimited)
+	s.SetPending(queued, now)
+	require.Equal(t, 1, s.PendingLen())
+
+	// A repeated report replaces the latest state but must not create a
+	// duplicate entry or change the queue position.
+	updated := newLimitedAlert(t, "queued", now, now.Add(2*time.Hour))
+	updated.UpdatedAt = now.Add(time.Second)
+	s.SetPending(updated, now.Add(time.Second))
+	require.Equal(t, 1, s.PendingLen())
+
+	got, ok := s.GetPending(queued.Name(), queued.Fingerprint())
+	require.True(t, ok)
+	require.Equal(t, updated.EndsAt, got.EndsAt)
+}
+
+func TestPendingExpiredEntriesAreDropped(t *testing.T) {
+	now := time.Now()
+	s := NewAlerts().WithPerAlertLimit(1)
+
+	active := newLimitedAlert(t, "active", now, now.Add(time.Hour))
+	require.NoError(t, s.Set(active))
+
+	expired := newLimitedAlert(t, "expired", now.Add(-2*time.Hour), now.Add(-time.Hour))
+	firing := newLimitedAlert(t, "firing", now, now.Add(time.Hour))
+	s.SetPending(expired, now.Add(-2*time.Hour))
+	s.SetPending(firing, now)
+	require.Equal(t, 2, s.PendingLen())
+
+	// Reconciliation drops the expired instance without admitting it and
+	// keeps the firing instance queued because the slot is still occupied.
+	require.Empty(t, s.PromotePending(now))
+	require.Equal(t, 1, s.PendingLen())
+	_, ok := s.GetPending(expired.Name(), expired.Fingerprint())
+	require.False(t, ok)
+}
+
+func TestGCPrunesExpiredPendingEntries(t *testing.T) {
+	now := time.Now()
+	s := NewAlerts().WithPerAlertLimit(1)
+
+	expired := newLimitedAlert(t, "expired", now.Add(-2*time.Hour), now.Add(-time.Hour))
+	firing := newLimitedAlert(t, "firing", now, now.Add(time.Hour))
+	s.SetPending(expired, now.Add(-2*time.Hour))
+	s.SetPending(firing, now)
+
+	s.GC()
+
+	require.Equal(t, 1, s.PendingLen())
+	_, ok := s.GetPending(firing.Name(), firing.Fingerprint())
+	require.True(t, ok)
+	_, ok = s.GetPending(expired.Name(), expired.Fingerprint())
+	require.False(t, ok)
+}
+
+func TestSetAdmissionClearsPendingState(t *testing.T) {
+	now := time.Now()
+	s := NewAlerts().WithPerAlertLimit(1)
+
+	queued := newLimitedAlert(t, "queued", now, now.Add(time.Hour))
+	s.SetPending(queued, now)
+	require.Equal(t, 1, s.PendingLen())
+
+	// With no competing entry the same fingerprint is admitted directly and
+	// must never exist in both the store and the overflow queue.
+	require.NoError(t, s.Set(queued))
+	require.Equal(t, 0, s.PendingLen())
+	if _, err := s.Get(queued.Fingerprint()); err != nil {
+		t.Fatalf("queued alert should have been admitted: %v", err)
+	}
+}
+
+func TestDeleteIfNotModifiedRemovesPendingState(t *testing.T) {
+	now := time.Now()
+	s := NewAlerts().WithPerAlertLimit(1)
+
+	queued := newLimitedAlert(t, "queued", now, now.Add(time.Hour))
+	s.SetPending(queued, now)
+	require.Equal(t, 1, s.PendingLen())
+
+	require.NoError(t, s.DeleteIfNotModified(alert.AlertSlice{queued}, false))
+	require.Equal(t, 0, s.PendingLen())
+}
+
+func fps(alerts []*alert.Alert) []model.Fingerprint {
+	out := make([]model.Fingerprint, 0, len(alerts))
+	for _, alrt := range alerts {
+		out = append(out, alrt.Fingerprint())
+	}
+	return out
+}

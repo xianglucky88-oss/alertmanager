@@ -32,6 +32,7 @@ import (
 
 	"github.com/prometheus/alertmanager/alert"
 	"github.com/prometheus/alertmanager/eventrecorder"
+	"github.com/prometheus/alertmanager/provider"
 	"github.com/prometheus/alertmanager/store"
 )
 
@@ -559,4 +560,241 @@ func TestSubscriberChannelMetrics(t *testing.T) {
 		writeCount := getCounterValue("alertmanager_alerts_subscriber_channel_writes_total", "subscriber", subscriberName)
 		return writeCount == float64(len(alertsToSend))
 	}, 1*time.Second, 10*time.Millisecond, "subscriberChannelWrites should equal the number of alerts sent")
+}
+
+// admissionCallback counts PostStore invocations per fingerprint so that
+// overflow reconciliation can be proven to fan each instance out exactly once.
+type admissionCallback struct {
+	noopCallback
+	mtx    sync.Mutex
+	counts map[model.Fingerprint]int
+}
+
+func newAdmissionCallback() *admissionCallback {
+	return &admissionCallback{counts: map[model.Fingerprint]int{}}
+}
+
+func (c *admissionCallback) PostStore(alrt *alert.Alert, existing bool) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if !existing {
+		c.counts[alrt.Fingerprint()]++
+	}
+}
+
+func (c *admissionCallback) count(fp model.Fingerprint) int {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.counts[fp]
+}
+
+// drainIterator returns the fingerprints of all alerts currently buffered by
+// the iterator without blocking.
+func drainIterator(t *testing.T, it provider.AlertIterator) []model.Fingerprint {
+	t.Helper()
+	var out []model.Fingerprint
+	for {
+		select {
+		case msg, ok := <-it.Next():
+			if !ok {
+				return out
+			}
+			out = append(out, msg.Data.Fingerprint())
+		default:
+			return out
+		}
+	}
+}
+
+func metricValue(t *testing.T, reg *prometheus.Registry, name string) float64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+		var total float64
+		for _, m := range mf.GetMetric() {
+			switch mf.GetType().String() {
+			case "COUNTER":
+				total += m.GetCounter().GetValue()
+			case "GAUGE":
+				total += m.GetGauge().GetValue()
+			}
+		}
+		return total
+	}
+	t.Fatalf("metric %q not registered", name)
+	return 0
+}
+
+func newOverflowAlert(t *testing.T, instance string, start, end time.Time) *alert.Alert {
+	t.Helper()
+	return alert.New(model.Alert{
+		Labels: model.LabelSet{
+			model.AlertNameLabel: "TestAlert",
+			"instance":           model.LabelValue(instance),
+		},
+		StartsAt: start,
+		EndsAt:   end,
+	}, start, false)
+}
+
+// TestAlertsOverflowDeferredAndPromoted verifies that an instance rejected by
+// the per-alert-name limit is retained in a recoverable state and re-enters
+// the subscriber chain (grouping, silence/inhibition and notification) once
+// capacity frees up.
+func TestAlertsOverflowDeferredAndPromoted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		reg := prometheus.NewRegistry()
+		alerts, err := NewAlerts(t.Context(), 200*time.Millisecond, 1, noopCallback{}, promslog.NewNopLogger(), eventrecorder.NopRecorder(), reg, nil)
+		require.NoError(t, err)
+
+		it := alerts.Subscribe("test")
+		defer it.Close()
+
+		t0 := time.Now()
+		active := newOverflowAlert(t, "active", t0, t0.Add(100*time.Millisecond))
+		queued := newOverflowAlert(t, "queued", t0, t0.Add(time.Hour))
+
+		require.NoError(t, alerts.Put(context.Background(), active, queued))
+
+		// The active instance is admitted while the overflowing one is
+		// retained but invisible to the store and to subscribers.
+		_, err = alerts.Get(active.Fingerprint())
+		require.NoError(t, err)
+		_, err = alerts.Get(queued.Fingerprint())
+		require.ErrorIs(t, err, store.ErrNotFound)
+		require.Equal(t, 1, alerts.alerts.PendingLen())
+		require.Equal(t, float64(1), metricValue(t, reg, "alertmanager_alerts_overflow_pending"))
+		require.Equal(t, float64(1), metricValue(t, reg, "alertmanager_alerts_limited_total"))
+
+		synctest.Wait()
+		require.ElementsMatch(t, []model.Fingerprint{active.Fingerprint()}, drainIterator(t, it))
+
+		// After the active instance is garbage collected, the queued
+		// instance is promoted through the regular admission path.
+		time.Sleep(300 * time.Millisecond)
+		synctest.Wait()
+
+		got, err := alerts.Get(queued.Fingerprint())
+		require.NoError(t, err)
+		require.Equal(t, queued.Fingerprint(), got.Fingerprint())
+		require.Equal(t, 0, alerts.alerts.PendingLen())
+		require.Equal(t, float64(0), metricValue(t, reg, "alertmanager_alerts_overflow_pending"))
+		require.ElementsMatch(t, []model.Fingerprint{queued.Fingerprint()}, drainIterator(t, it))
+	})
+}
+
+// TestAlertsOverflowRepeatedReportsNoDuplicates verifies that heartbeats for
+// an overflowing instance update its retained state without duplicating it and
+// that its eventual admission fans out exactly once.
+func TestAlertsOverflowRepeatedReportsNoDuplicates(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cb := newAdmissionCallback()
+		alerts, err := NewAlerts(t.Context(), 200*time.Millisecond, 1, cb, promslog.NewNopLogger(), eventrecorder.NopRecorder(), prometheus.NewRegistry(), nil)
+		require.NoError(t, err)
+
+		it := alerts.Subscribe("test")
+		defer it.Close()
+
+		t0 := time.Now()
+		active := newOverflowAlert(t, "active", t0, t0.Add(time.Hour))
+		queued := newOverflowAlert(t, "queued", t0, t0.Add(time.Hour))
+		require.NoError(t, alerts.Put(context.Background(), active, queued))
+		require.Equal(t, 1, alerts.alerts.PendingLen())
+
+		// Repeated reports, including an annotation update, must keep a
+		// single retained entry and never reach subscribers.
+		queuedUpdate := *queued
+		queuedUpdate.Annotations = model.LabelSet{"version": "2"}
+		queuedUpdate.UpdatedAt = t0.Add(time.Second)
+		require.NoError(t, alerts.Put(context.Background(), &queuedUpdate))
+		require.NoError(t, alerts.Put(context.Background(), queued))
+		require.Equal(t, 1, alerts.alerts.PendingLen())
+		require.Equal(t, 0, cb.count(queued.Fingerprint()))
+
+		synctest.Wait()
+		require.ElementsMatch(t, []model.Fingerprint{active.Fingerprint()}, drainIterator(t, it))
+
+		// Resolve the active instance: the next GC removes it and promotes
+		// the queued instance a single time.
+		resolvedActive := newOverflowAlert(t, "active", t0, time.Now())
+		resolvedActive.UpdatedAt = time.Now()
+		require.NoError(t, alerts.Put(context.Background(), resolvedActive))
+
+		time.Sleep(300 * time.Millisecond)
+		synctest.Wait()
+
+		require.Equal(t, 0, alerts.alerts.PendingLen())
+		_, err = alerts.Get(queued.Fingerprint())
+		require.NoError(t, err)
+		require.Equal(t, 1, cb.count(queued.Fingerprint()), "queued instance must be admitted exactly once")
+		require.ElementsMatch(t, []model.Fingerprint{resolvedActive.Fingerprint(), queued.Fingerprint()}, drainIterator(t, it))
+	})
+}
+
+// TestAlertsOverflowResolvedWhilePendingDropped verifies that an instance
+// which resolves while waiting for capacity never enters the notification
+// pipeline and is pruned during garbage collection.
+func TestAlertsOverflowResolvedWhilePendingDropped(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cb := newAdmissionCallback()
+		reg := prometheus.NewRegistry()
+		alerts, err := NewAlerts(t.Context(), 200*time.Millisecond, 1, cb, promslog.NewNopLogger(), eventrecorder.NopRecorder(), reg, nil)
+		require.NoError(t, err)
+
+		it := alerts.Subscribe("test")
+		defer it.Close()
+
+		t0 := time.Now()
+		active := newOverflowAlert(t, "active", t0, t0.Add(time.Hour))
+		queued := newOverflowAlert(t, "queued", t0, t0.Add(time.Hour))
+		require.NoError(t, alerts.Put(context.Background(), active, queued))
+		require.Equal(t, 1, alerts.alerts.PendingLen())
+
+		// A resolved report for the queued instance replaces its retained
+		// state; reconciliation drops it immediately because the instance was
+		// never admitted while firing, so it must not reach the store or
+		// subscribers.
+		resolvedQueued := newOverflowAlert(t, "queued", t0, time.Now())
+		resolvedQueued.UpdatedAt = time.Now()
+		require.NoError(t, alerts.Put(context.Background(), resolvedQueued))
+		require.Equal(t, 0, alerts.alerts.PendingLen())
+
+		time.Sleep(300 * time.Millisecond)
+		synctest.Wait()
+
+		require.Equal(t, 0, alerts.alerts.PendingLen())
+		require.Equal(t, float64(0), metricValue(t, reg, "alertmanager_alerts_overflow_pending"))
+		_, err = alerts.Get(queued.Fingerprint())
+		require.ErrorIs(t, err, store.ErrNotFound)
+		require.Equal(t, 0, cb.count(queued.Fingerprint()))
+		require.ElementsMatch(t, []model.Fingerprint{active.Fingerprint()}, drainIterator(t, it))
+	})
+}
+
+// TestAlertsOverflowDisabledKeepsLegacyBehavior verifies that without the
+// per-alert-name limit configured every alert is admitted directly and the
+// overflow machinery stays inert.
+func TestAlertsOverflowDisabledKeepsLegacyBehavior(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	alerts, err := NewAlerts(context.Background(), 30*time.Minute, 0, noopCallback{}, promslog.NewNopLogger(), eventrecorder.NopRecorder(), reg, nil)
+	require.NoError(t, err)
+
+	t0 := time.Now()
+	insert := []*alert.Alert{
+		newOverflowAlert(t, "a", t0, t0.Add(time.Hour)),
+		newOverflowAlert(t, "b", t0, t0.Add(time.Hour)),
+		newOverflowAlert(t, "c", t0, t0.Add(time.Hour)),
+	}
+	require.NoError(t, alerts.Put(context.Background(), insert...))
+
+	for _, alrt := range insert {
+		_, err := alerts.Get(alrt.Fingerprint())
+		require.NoError(t, err)
+	}
+	require.Equal(t, 0, alerts.alerts.PendingLen())
+	require.Equal(t, float64(0), metricValue(t, reg, "alertmanager_alerts_overflow_pending"))
 }

@@ -88,11 +88,22 @@ It's important not to load balance traffic between Prometheus and its Alertmanag
 Alertmanager supports configuration to limit the number of active alerts per alertname.
 This can be configured using the [--alerts.per-alertname-limit] flag.
 
-When the limit is reached any new alerts are dropped, heartbeats from already know alerts are processed.
-The known alert (fingerprint) automatically expire to make room for new alerts.
+When the limit is reached, new alert instances are no longer dropped: they are retained in
+an in-memory overflow queue instead, keeping the latest firing or resolved state of each
+instance. Heartbeats from already known alerts continue to be processed, and repeated
+reports of a queued instance update its state in place without creating duplicates.
+
+As active alerts expire or are garbage collected, queued instances re-enter the regular
+pipeline in stable first-in-first-out order, so they go through the same grouping,
+silence/inhibition and notification stages as directly admitted alerts. An instance that
+resolves while still queued is removed without being notified, since it was never admitted
+while firing. The overflow state is not persisted: after a process restart alerts are
+re-reported by their senders and admitted normally, while the notification log prevents
+duplicate notifications.
 
 This feature is useful when an unexpected high number of instances of the same alert are sent to Alertmanager.
 Limiting the number of alerts per alertname can prevent reliability issues and avoid alert receivers from being flooded.
 
-The `alertmanager_alerts_limited_total` metric shows the total number of alerts that were dropped due to per alert name limit.
-Enabling the `alert-names-in-metrics` feature flag will add the `alertname` label to the metric.
+The `alertmanager_alerts_limited_total` metric shows the total number of alerts that were deferred to the overflow queue due to the per alert name limit.
+The `alertmanager_alerts_overflow_pending` gauge shows the number of alerts currently held in the overflow queue.
+Enabling the `alert-names-in-metrics` feature flag will add the `alertname` label to the `alertmanager_alerts_limited_total` metric.

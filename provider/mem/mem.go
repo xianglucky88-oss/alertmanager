@@ -60,6 +60,7 @@ type Alerts struct {
 
 	alertsLimit             prometheus.Gauge
 	alertsLimitedTotal      *prometheus.CounterVec
+	alertsOverflowPending   prometheus.Gauge
 	subscriberChannelWrites *prometheus.CounterVec
 }
 
@@ -99,10 +100,15 @@ func (a *Alerts) registerMetrics(r prometheus.Registerer) {
 	a.alertsLimitedTotal = promauto.With(r).NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "alertmanager_alerts_limited_total",
-			Help: "Total number of alerts that were dropped due to per alert name limit",
+			Help: "Total number of alerts that were deferred to the overflow queue due to per alert name limit",
 		},
 		labels,
 	)
+
+	a.alertsOverflowPending = promauto.With(r).NewGauge(prometheus.GaugeOpts{
+		Name: "alertmanager_alerts_overflow_pending",
+		Help: "Number of alerts retained in the overflow queue waiting for per alert name capacity",
+	})
 
 	a.subscriberChannelWrites = promauto.With(r).NewCounterVec(
 		prometheus.CounterOpts{
@@ -182,6 +188,8 @@ func (a *Alerts) gc() {
 
 	// If there are no deleted alerts, there is nothing to do.
 	if len(deleted) == 0 {
+		// Overflow entries may still have expired and need to be pruned.
+		a.reconcilePending(context.Background())
 		return
 	}
 
@@ -191,6 +199,10 @@ func (a *Alerts) gc() {
 		a.callback.PostDelete(alrt)
 	}
 	a.callback.PostGC(ff)
+
+	// Resolved alerts freed per-alert-name capacity: admit overflowed
+	// instances in stable order.
+	a.reconcilePending(context.Background())
 }
 
 func (a *Alerts) gcAlerts() []*alert.Alert {
@@ -311,64 +323,115 @@ func (a *Alerts) Put(ctx context.Context, alerts ...*alert.Alert) error {
 	defer span.End()
 
 	for _, alrt := range alerts {
-		fp := alrt.Fingerprint()
+		a.storeAlert(ctx, alrt)
+	}
 
-		existing := false
+	// Bucket entries may have expired since the last report, freeing
+	// capacity for alerts retained in overflow.
+	a.reconcilePending(ctx)
 
-		// Check that there's an alert existing within the store before
-		// trying to merge.
-		if old, err := a.alerts.Get(fp); err == nil {
-			existing = true
+	return nil
+}
 
-			// Merge alerts if there is an overlap in activity range.
-			if (alrt.EndsAt.After(old.StartsAt) && alrt.EndsAt.Before(old.EndsAt)) ||
-				(alrt.StartsAt.After(old.StartsAt) && alrt.StartsAt.Before(old.EndsAt)) {
-				alrt = old.Merge(alrt)
-			}
+// storeAlert admits a single reported alert or, when the per-alert-name limit
+// is reached, retains its latest state in the overflow queue. The caller must
+// hold a.mtx.
+func (a *Alerts) storeAlert(ctx context.Context, alrt *alert.Alert) {
+	fp := alrt.Fingerprint()
+
+	existing := false
+
+	// Check that there's an alert existing within the store before
+	// trying to merge.
+	if old, err := a.alerts.Get(fp); err == nil {
+		existing = true
+
+		// Merge alerts if there is an overlap in activity range.
+		if (alrt.EndsAt.After(old.StartsAt) && alrt.EndsAt.Before(old.EndsAt)) ||
+			(alrt.StartsAt.After(old.StartsAt) && alrt.StartsAt.Before(old.EndsAt)) {
+			alrt = old.Merge(alrt)
 		}
-
-		if err := a.callback.PreStore(alrt, existing); err != nil {
-			a.logger.Error("pre-store callback returned error on set alert", "err", err)
-			continue
-		}
-
-		if err := a.alerts.Set(alrt); err != nil {
-			a.logger.Warn("error on set alert", "alertname", alrt.Name(), "err", err)
-			if errors.Is(err, store.ErrLimited) {
-				labels := []string{}
-				if a.flagger.EnableAlertNamesInMetrics() {
-					labels = append(labels, alrt.Name())
-				}
-				a.alertsLimitedTotal.WithLabelValues(labels...).Inc()
-			}
-			continue
-		}
-
-		a.callback.PostStore(alrt, existing)
-
-		if !existing {
-			a.recorder.RecordEvent(ctx, func() eventrecorder.EventData {
-				return eventrecorder.NewAlertCreatedEvent(alrt)
-			})
-		}
-
-		metadata := map[string]string{}
-		a.propagator.Inject(ctx, propagation.MapCarrier(metadata))
-		msg := &provider.Alert{
-			Data:   alrt,
-			Header: metadata,
-		}
-
-		for _, l := range a.listeners {
-			select {
-			case l.alerts <- msg:
-				a.subscriberChannelWrites.WithLabelValues(l.name).Inc()
-			case <-l.done:
-			}
+	} else if old, ok := a.alerts.GetPending(alrt.Name(), fp); ok {
+		// The instance is retained in overflow: keep merging against its
+		// latest queued state so its firing/resolved history is preserved.
+		if (alrt.EndsAt.After(old.StartsAt) && alrt.EndsAt.Before(old.EndsAt)) ||
+			(alrt.StartsAt.After(old.StartsAt) && alrt.StartsAt.Before(old.EndsAt)) {
+			alrt = old.Merge(alrt)
 		}
 	}
 
-	return nil
+	if err := a.callback.PreStore(alrt, existing); err != nil {
+		a.logger.Error("pre-store callback returned error on set alert", "err", err)
+		return
+	}
+
+	if err := a.alerts.Set(alrt); err != nil {
+		if !errors.Is(err, store.ErrLimited) {
+			a.logger.Warn("error on set alert", "alertname", alrt.Name(), "err", err)
+			return
+		}
+
+		// Retain the instance in a recoverable state instead of dropping
+		// it. Repeated reports update its state in place without changing
+		// its queue position.
+		a.alerts.SetPending(alrt, time.Now())
+		labels := []string{}
+		if a.flagger.EnableAlertNamesInMetrics() {
+			labels = append(labels, alrt.Name())
+		}
+		a.alertsLimitedTotal.WithLabelValues(labels...).Inc()
+		return
+	}
+
+	a.afterAdmit(ctx, alrt, existing)
+}
+
+// reconcilePending admits overflow alerts for which capacity has been freed
+// and runs the regular post-admission processing for each of them exactly
+// once. The caller must hold a.mtx.
+func (a *Alerts) reconcilePending(ctx context.Context) {
+	admitted := a.alerts.PromotePending(time.Now())
+	for _, alrt := range admitted {
+		a.afterAdmit(ctx, alrt, false)
+	}
+	a.recordOverflowGauge()
+}
+
+// afterAdmit runs the processing shared by alerts admitted directly through
+// Put and alerts promoted from the overflow queue: the store callback, the
+// creation event and the fan-out to all subscribers (dispatcher, inhibitor),
+// which takes them through grouping, silence/inhibition and notification.
+func (a *Alerts) afterAdmit(ctx context.Context, alrt *alert.Alert, existing bool) {
+	a.callback.PostStore(alrt, existing)
+
+	if !existing {
+		a.recorder.RecordEvent(ctx, func() eventrecorder.EventData {
+			return eventrecorder.NewAlertCreatedEvent(alrt)
+		})
+	}
+
+	metadata := map[string]string{}
+	a.propagator.Inject(ctx, propagation.MapCarrier(metadata))
+	msg := &provider.Alert{
+		Data:   alrt,
+		Header: metadata,
+	}
+
+	for _, l := range a.listeners {
+		select {
+		case l.alerts <- msg:
+			a.subscriberChannelWrites.WithLabelValues(l.name).Inc()
+		case <-l.done:
+		}
+	}
+}
+
+// recordOverflowGauge publishes the current overflow queue depth. It is a
+// no-op when metrics registration was skipped.
+func (a *Alerts) recordOverflowGauge() {
+	if a.alertsOverflowPending != nil {
+		a.alertsOverflowPending.Set(float64(a.alerts.PendingLen()))
+	}
 }
 
 type noopCallback struct{}
