@@ -27,6 +27,8 @@ import (
 	"github.com/go-openapi/errors"
 	"github.com/go-openapi/runtime"
 	"github.com/go-openapi/runtime/middleware"
+	"github.com/go-openapi/strfmt"
+	"github.com/go-openapi/swag"
 	"github.com/go-openapi/validate"
 
 	"github.com/prometheus/alertmanager/api/v2/models"
@@ -48,6 +50,22 @@ type PostAlertsParams struct {
 	// HTTP Request Object
 	HTTPRequest *http.Request `json:"-"`
 
+	/*Unique identifier of the batch within one sending source. Re-submitting the same source and batch id does not drive grouping or notifications again. Must be provided together with X-Alertmanager-Source-Id and X-Alertmanager-Batch-Sequence.
+	  In: header
+	*/
+	XAlertmanagerBatchID *string
+
+	/*Monotonically increasing batch sequence within one sending source. Batches with a sequence that is not greater than the latest accepted sequence for the same source are rejected so older batches cannot overwrite newer state. Must be provided together with X-Alertmanager-Source-Id and X-Alertmanager-Batch-Id.
+	  Minimum: 0
+	  In: header
+	*/
+	XAlertmanagerBatchSequence *int64
+
+	/*Identifies the sending source for optional source-level batch idempotency. This header is only honored together with X-Alertmanager-Batch-Id and X-Alertmanager-Batch-Sequence; when none of them is set, alerts are accepted with the legacy semantics.
+	  In: header
+	*/
+	XAlertmanagerSourceID *string
+
 	/*The alerts to create
 	  Required: true
 	  In: body
@@ -63,6 +81,18 @@ func (o *PostAlertsParams) BindRequest(r *http.Request, route *middleware.Matche
 	var res []error
 
 	o.HTTPRequest = r
+
+	if err := o.bindXAlertmanagerBatchID(r.Header[http.CanonicalHeaderKey("X-Alertmanager-Batch-Id")], true, route.Formats); err != nil {
+		res = append(res, err)
+	}
+
+	if err := o.bindXAlertmanagerBatchSequence(r.Header[http.CanonicalHeaderKey("X-Alertmanager-Batch-Sequence")], true, route.Formats); err != nil {
+		res = append(res, err)
+	}
+
+	if err := o.bindXAlertmanagerSourceID(r.Header[http.CanonicalHeaderKey("X-Alertmanager-Source-Id")], true, route.Formats); err != nil {
+		res = append(res, err)
+	}
 
 	if runtime.HasBody(r) {
 		defer func() {
@@ -96,5 +126,75 @@ func (o *PostAlertsParams) BindRequest(r *http.Request, route *middleware.Matche
 	if len(res) > 0 {
 		return errors.CompositeValidationError(res...)
 	}
+	return nil
+}
+
+// bindXAlertmanagerBatchID binds and validates parameter XAlertmanagerBatchID from header.
+func (o *PostAlertsParams) bindXAlertmanagerBatchID(rawData []string, hasKey bool, formats strfmt.Registry) error {
+	var raw string
+	if len(rawData) > 0 {
+		raw = rawData[len(rawData)-1]
+	}
+
+	// Required: false
+
+	if raw == "" { // empty values pass all other validations
+		return nil
+	}
+	o.XAlertmanagerBatchID = &raw
+
+	return nil
+}
+
+// bindXAlertmanagerBatchSequence binds and validates parameter XAlertmanagerBatchSequence from header.
+func (o *PostAlertsParams) bindXAlertmanagerBatchSequence(rawData []string, hasKey bool, formats strfmt.Registry) error {
+	var raw string
+	if len(rawData) > 0 {
+		raw = rawData[len(rawData)-1]
+	}
+
+	// Required: false
+
+	if raw == "" { // empty values pass all other validations
+		return nil
+	}
+
+	value, err := swag.ConvertInt64(raw)
+	if err != nil {
+		return errors.InvalidType("X-Alertmanager-Batch-Sequence", "header", "int64", raw)
+	}
+	o.XAlertmanagerBatchSequence = &value
+
+	if err := o.validateXAlertmanagerBatchSequence(formats); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateXAlertmanagerBatchSequence carries out validations for parameter XAlertmanagerBatchSequence
+func (o *PostAlertsParams) validateXAlertmanagerBatchSequence(formats strfmt.Registry) error {
+
+	if err := validate.MinimumInt("X-Alertmanager-Batch-Sequence", "header", *o.XAlertmanagerBatchSequence, 0, false); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// bindXAlertmanagerSourceID binds and validates parameter XAlertmanagerSourceID from header.
+func (o *PostAlertsParams) bindXAlertmanagerSourceID(rawData []string, hasKey bool, formats strfmt.Registry) error {
+	var raw string
+	if len(rawData) > 0 {
+		raw = rawData[len(rawData)-1]
+	}
+
+	// Required: false
+
+	if raw == "" { // empty values pass all other validations
+		return nil
+	}
+	o.XAlertmanagerSourceID = &raw
+
 	return nil
 }

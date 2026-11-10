@@ -65,6 +65,9 @@ type Options struct {
 	Alerts provider.Alerts
 	// Silences to be used by the API. Mandatory.
 	Silences *silence.Silences
+	// BatchRecorder enables optional source-level batch idempotency for
+	// alert ingestion. If nil, alerts are accepted with the legacy semantics.
+	BatchRecorder apiv2.BatchRecorder
 	// Peer from the gossip cluster. If nil, no clustering will be used.
 	Peer cluster.ClusterPeer
 	// Timeout for HTTP requests and Connect unary RPCs. The zero value and
@@ -200,6 +203,7 @@ func New(opts Options) (*API, error) {
 	if err != nil {
 		return nil, err
 	}
+	v2.SetBatchRecorder(opts.BatchRecorder)
 	connect := apiconnect.NewAPI(effective.connect)
 
 	requestsInFlight := prometheus.NewGauge(prometheus.GaugeOpts{

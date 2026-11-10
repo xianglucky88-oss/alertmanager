@@ -50,6 +50,7 @@ import (
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/dispatch"
 	"github.com/prometheus/alertmanager/eventrecorder"
+	"github.com/prometheus/alertmanager/idempotency"
 	"github.com/prometheus/alertmanager/labelset"
 	"github.com/prometheus/alertmanager/marker"
 	"github.com/prometheus/alertmanager/matcher/compat"
@@ -64,11 +65,12 @@ var tracer = tracing.NewTracer("github.com/prometheus/alertmanager/api/v2")
 
 // API represents an Alertmanager API v2.
 type API struct {
-	peer        cluster.ClusterPeer
-	silences    *silence.Silences
-	alerts      provider.Alerts
-	alertGroups groupsFn
-	uptime      time.Time
+	peer          cluster.ClusterPeer
+	silences      *silence.Silences
+	alerts        provider.Alerts
+	alertGroups   groupsFn
+	batchRecorder BatchRecorder
+	uptime        time.Time
 
 	// mtx protects alertmanagerConfig, setAlertStatus and route.
 	mtx sync.RWMutex
@@ -139,6 +141,12 @@ func NewAPI(
 	api.Handler = setResponseHeaders(openAPI.Serve(nil))
 
 	return &api, nil
+}
+
+// SetBatchRecorder enables source-level batch idempotency for alert
+// ingestion. Passing nil disables the feature.
+func (api *API) SetBatchRecorder(r BatchRecorder) {
+	api.batchRecorder = r
 }
 
 var responseHeaders = map[string]string{
@@ -351,6 +359,42 @@ func (api *API) postAlertsHandler(params alert_ops.PostAlertsParams) middleware.
 	ctx, span := tracer.Start(eventrecorder.WithEventRecording(params.HTTPRequest.Context()), "api.postAlertsHandler")
 	defer span.End()
 
+	// Optional source-level batch idempotency. When the client does not
+	// send the identifier headers the recorder is nil or disabled and the
+	// legacy ingest semantics apply unchanged.
+	var batch *batchIdentifier
+	if api.batchRecorder != nil {
+		id, enabled, err := parseBatchIdentifier(params.HTTPRequest)
+		if err != nil {
+			logger.Error("Rejected alert batch with an incomplete idempotency identifier", "err", err)
+			return alert_ops.NewPostAlertsBadRequest().WithPayload(err.Error())
+		}
+		if enabled {
+			outcome, err := api.batchRecorder.Begin(ctx, id.source, id.batchID, id.sequence)
+			if err != nil {
+				if errors.Is(err, idempotency.ErrStaleBatch) ||
+					errors.Is(err, idempotency.ErrIncompleteBatchState) ||
+					errors.Is(err, idempotency.ErrIncompleteIdentifier) {
+					logger.Error("Rejected idempotent alert batch", "err", err)
+					return alert_ops.NewPostAlertsBadRequest().WithPayload(err.Error())
+				}
+				message := "Failed to persist idempotent batch state"
+				err = ensureIdempotencyPrefix(err)
+				logger.Error(message, "err", err)
+				span.SetStatus(codes.Error, message)
+				span.RecordError(err)
+				return alert_ops.NewPostAlertsInternalServerError().WithPayload(err.Error())
+			}
+			if outcome == idempotency.OutcomeDuplicate {
+				// The batch was already ingested: do not drive grouping or
+				// notifications a second time and answer idempotently.
+				logger.Debug("Ignoring duplicate alert batch", "source", id.source, "batch_id", id.batchID)
+				return alert_ops.NewPostAlertsOK()
+			}
+			batch = &id
+		}
+	}
+
 	alerts := OpenAPIAlertsToAlerts(ctx, params.Alerts)
 
 	now := time.Now()
@@ -404,6 +448,19 @@ func (api *API) postAlertsHandler(params alert_ops.PostAlertsParams) middleware.
 		span.SetStatus(codes.Error, message)
 		span.RecordError(err)
 		return alert_ops.NewPostAlertsInternalServerError().WithPayload(err.Error())
+	}
+
+	// Close the batch even when some alerts failed validation: the valid
+	// alerts were already ingested, so a retry must not ingest them again.
+	if batch != nil {
+		if err := api.batchRecorder.Complete(ctx, batch.source, batch.batchID, len(validAlerts)); err != nil {
+			message := "Failed to persist idempotent batch state"
+			err = ensureIdempotencyPrefix(err)
+			logger.Error(message, "err", err)
+			span.SetStatus(codes.Error, message)
+			span.RecordError(err)
+			return alert_ops.NewPostAlertsInternalServerError().WithPayload(err.Error())
+		}
 	}
 
 	if validationErrs != nil {

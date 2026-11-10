@@ -28,6 +28,7 @@ import (
 	"github.com/go-openapi/runtime"
 	cr "github.com/go-openapi/runtime/client"
 	"github.com/go-openapi/strfmt"
+	"github.com/go-openapi/swag"
 
 	"github.com/prometheus/alertmanager/api/v2/models"
 )
@@ -76,6 +77,26 @@ PostAlertsParams contains all the parameters to send to the API endpoint
 	Typically these are written to a http.Request.
 */
 type PostAlertsParams struct {
+
+	/* XAlertmanagerBatchID.
+
+	   Unique identifier of the batch within one sending source. Re-submitting the same source and batch id does not drive grouping or notifications again. Must be provided together with X-Alertmanager-Source-Id and X-Alertmanager-Batch-Sequence.
+	*/
+	XAlertmanagerBatchID *string
+
+	/* XAlertmanagerBatchSequence.
+
+	   Monotonically increasing batch sequence within one sending source. Batches with a sequence that is not greater than the latest accepted sequence for the same source are rejected so older batches cannot overwrite newer state. Must be provided together with X-Alertmanager-Source-Id and X-Alertmanager-Batch-Id.
+
+	   Format: int64
+	*/
+	XAlertmanagerBatchSequence *int64
+
+	/* XAlertmanagerSourceID.
+
+	   Identifies the sending source for optional source-level batch idempotency. This header is only honored together with X-Alertmanager-Batch-Id and X-Alertmanager-Batch-Sequence; when none of them is set, alerts are accepted with the legacy semantics.
+	*/
+	XAlertmanagerSourceID *string
 
 	/* Alerts.
 
@@ -136,6 +157,39 @@ func (o *PostAlertsParams) SetHTTPClient(client *http.Client) {
 	o.HTTPClient = client
 }
 
+// WithXAlertmanagerBatchID adds the xAlertmanagerBatchID to the post alerts params
+func (o *PostAlertsParams) WithXAlertmanagerBatchID(xAlertmanagerBatchID *string) *PostAlertsParams {
+	o.SetXAlertmanagerBatchID(xAlertmanagerBatchID)
+	return o
+}
+
+// SetXAlertmanagerBatchID adds the xAlertmanagerBatchId to the post alerts params
+func (o *PostAlertsParams) SetXAlertmanagerBatchID(xAlertmanagerBatchID *string) {
+	o.XAlertmanagerBatchID = xAlertmanagerBatchID
+}
+
+// WithXAlertmanagerBatchSequence adds the xAlertmanagerBatchSequence to the post alerts params
+func (o *PostAlertsParams) WithXAlertmanagerBatchSequence(xAlertmanagerBatchSequence *int64) *PostAlertsParams {
+	o.SetXAlertmanagerBatchSequence(xAlertmanagerBatchSequence)
+	return o
+}
+
+// SetXAlertmanagerBatchSequence adds the xAlertmanagerBatchSequence to the post alerts params
+func (o *PostAlertsParams) SetXAlertmanagerBatchSequence(xAlertmanagerBatchSequence *int64) {
+	o.XAlertmanagerBatchSequence = xAlertmanagerBatchSequence
+}
+
+// WithXAlertmanagerSourceID adds the xAlertmanagerSourceID to the post alerts params
+func (o *PostAlertsParams) WithXAlertmanagerSourceID(xAlertmanagerSourceID *string) *PostAlertsParams {
+	o.SetXAlertmanagerSourceID(xAlertmanagerSourceID)
+	return o
+}
+
+// SetXAlertmanagerSourceID adds the xAlertmanagerSourceId to the post alerts params
+func (o *PostAlertsParams) SetXAlertmanagerSourceID(xAlertmanagerSourceID *string) {
+	o.XAlertmanagerSourceID = xAlertmanagerSourceID
+}
+
 // WithAlerts adds the alerts to the post alerts params
 func (o *PostAlertsParams) WithAlerts(alerts models.PostableAlerts) *PostAlertsParams {
 	o.SetAlerts(alerts)
@@ -154,6 +208,30 @@ func (o *PostAlertsParams) WriteToRequest(r runtime.ClientRequest, reg strfmt.Re
 		return err
 	}
 	var res []error
+
+	if o.XAlertmanagerBatchID != nil {
+
+		// header param X-Alertmanager-Batch-Id
+		if err := r.SetHeaderParam("X-Alertmanager-Batch-Id", *o.XAlertmanagerBatchID); err != nil {
+			return err
+		}
+	}
+
+	if o.XAlertmanagerBatchSequence != nil {
+
+		// header param X-Alertmanager-Batch-Sequence
+		if err := r.SetHeaderParam("X-Alertmanager-Batch-Sequence", swag.FormatInt64(*o.XAlertmanagerBatchSequence)); err != nil {
+			return err
+		}
+	}
+
+	if o.XAlertmanagerSourceID != nil {
+
+		// header param X-Alertmanager-Source-Id
+		if err := r.SetHeaderParam("X-Alertmanager-Source-Id", *o.XAlertmanagerSourceID); err != nil {
+			return err
+		}
+	}
 	if o.Alerts != nil {
 		if err := r.SetBodyParam(o.Alerts); err != nil {
 			return err

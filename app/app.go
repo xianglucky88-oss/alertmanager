@@ -39,6 +39,7 @@ import (
 	"github.com/prometheus/alertmanager/dispatch"
 	"github.com/prometheus/alertmanager/eventrecorder"
 	"github.com/prometheus/alertmanager/httpserver"
+	"github.com/prometheus/alertmanager/idempotency"
 	"github.com/prometheus/alertmanager/nflog"
 	"github.com/prometheus/alertmanager/notify"
 	"github.com/prometheus/alertmanager/provider/mem"
@@ -297,6 +298,19 @@ func (a *App) setup() error {
 		notificationLog.Maintenance(opts.MaintenanceInterval, filepath.Join(opts.DataDir, "nflog"), stopc, nil)
 	})
 
+	batchRecorder, err := idempotency.New(idempotency.Options{
+		SnapshotFile: filepath.Join(opts.DataDir, "idempotency"),
+		Retention:    opts.Retention,
+		Logger:       logger.With("component", "idempotency"),
+		Metrics:      reg,
+	})
+	if err != nil {
+		return fmt.Errorf("error creating batch idempotency recorder: %w", err)
+	}
+	wg.Go(func() {
+		batchRecorder.Maintenance(opts.MaintenanceInterval, stopc)
+	})
+
 	// Register the maintenance teardown as soon as the first maintenance
 	// goroutine is running. Registering it later (e.g., after silence
 	// setup) would leak the already-started goroutine(s) if an
@@ -387,6 +401,7 @@ func (a *App) setup() error {
 	apih, err := api.New(api.Options{
 		Alerts:                     alerts,
 		Silences:                   silences,
+		BatchRecorder:              batchRecorder,
 		Peer:                       clusterPeer,
 		Timeout:                    opts.HTTPTimeout,
 		Concurrency:                opts.GetConcurrency,

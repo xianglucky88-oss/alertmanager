@@ -208,6 +208,37 @@ paths:
       operationId: postAlerts
       description: Create new Alerts
       parameters:
+        - in: header
+          name: X-Alertmanager-Source-Id
+          type: string
+          required: false
+          description: >-
+            Identifies the sending source for optional source-level batch
+            idempotency. This header is only honored together with
+            X-Alertmanager-Batch-Id and X-Alertmanager-Batch-Sequence; when
+            none of them is set, alerts are accepted with the legacy
+            semantics.
+        - in: header
+          name: X-Alertmanager-Batch-Id
+          type: string
+          required: false
+          description: >-
+            Unique identifier of the batch within one sending source.
+            Re-submitting the same source and batch id does not drive
+            grouping or notifications again. Must be provided together with
+            X-Alertmanager-Source-Id and X-Alertmanager-Batch-Sequence.
+        - in: header
+          name: X-Alertmanager-Batch-Sequence
+          type: integer
+          format: int64
+          minimum: 0
+          required: false
+          description: >-
+            Monotonically increasing batch sequence within one sending
+            source. Batches with a sequence that is not greater than the
+            latest accepted sequence for the same source are rejected so
+            older batches cannot overwrite newer state. Must be provided
+            together with X-Alertmanager-Source-Id and X-Alertmanager-Batch-Id.
         - in: body
           name: alerts
           description: The alerts to create

@@ -74,3 +74,39 @@ expected to re-send resolved alerts to the Alertmanager for up to 5 minutes
 after the alert has resolved. As the Alertmanager is stateless, this ensures
 that a resolved notification is sent even if the Alertmanager crashes or is
 restarted.
+
+## Source-level batch idempotency
+
+Senders that want to safely retry a batch of alerts after a timeout can attach
+an optional source-level batch idempotency identifier to `POST api/v2/alerts`:
+
+| Header | Description |
+|---|---|
+| `X-Alertmanager-Source-Id` | Stable identifier of the sending source. |
+| `X-Alertmanager-Batch-Id` | Unique identifier of the batch within one source. |
+| `X-Alertmanager-Batch-Sequence` | Non-negative integer that increases monotonically per source. |
+
+The three headers are all-or-nothing: either send all three, or send none.
+Requests without any of them keep the legacy receive semantics unchanged.
+
+When the identifier is present, Alertmanager durably records every accepted
+batch, including across process restarts:
+
+- Re-submitting the same source and batch id returns `200` without driving
+  grouping or notifications again, so timed-out requests can be retried
+  safely.
+- A batch whose sequence is not greater than the latest accepted sequence for
+  the same source is rejected with `400` and a `stale batch` error, so older
+  batches cannot overwrite newer state.
+- A batch left unfinished by a previous process (for example because it
+  crashed mid-ingestion) is rejected with `400` and an `incomplete batch
+  state` error; resubmit it under a new batch id instead of replaying it.
+- Requests missing part of the identifier, or carrying a non-numeric sequence,
+  are rejected with `400` and an `incomplete batch identifier` error.
+- Failures while persisting the batch state are rejected with `500` and an
+  error message prefixed with `idempotency:`.
+
+Records are kept under the configured storage path and garbage-collected
+after `--data.retention`. Idempotency state is local to each Alertmanager
+instance and is not replicated over the gossip cluster, so retries should be
+directed to the same instance whenever possible.

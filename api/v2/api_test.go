@@ -17,10 +17,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"testing/synctest"
@@ -47,6 +49,7 @@ import (
 	"github.com/prometheus/alertmanager/dispatch"
 	"github.com/prometheus/alertmanager/eventrecorder"
 	"github.com/prometheus/alertmanager/featurecontrol"
+	"github.com/prometheus/alertmanager/idempotency"
 	"github.com/prometheus/alertmanager/labelset"
 	"github.com/prometheus/alertmanager/marker"
 	"github.com/prometheus/alertmanager/matcher/compat"
@@ -1633,4 +1636,296 @@ func TestPostAlertsHandlerIngestsFingerprintedAlerts(t *testing.T) {
 	for fp, count := range seen {
 		require.Equal(t, 1, count, "fingerprint %v stored %d times", fp, count)
 	}
+}
+
+// fakeBatchRecorder is a BatchRecorder double for handler tests.
+type fakeBatchRecorder struct {
+	beginOutcome idempotency.Outcome
+	beginErr     error
+	completeErr  error
+	begun        []string
+	completed    []string
+}
+
+func (f *fakeBatchRecorder) Begin(_ context.Context, source, batchID string, _ uint64) (idempotency.Outcome, error) {
+	f.begun = append(f.begun, source+"/"+batchID)
+	return f.beginOutcome, f.beginErr
+}
+
+func (f *fakeBatchRecorder) Complete(_ context.Context, source, batchID string, _ int) error {
+	f.completed = append(f.completed, source+"/"+batchID)
+	return f.completeErr
+}
+
+func newIdempotencyTestAPI(t *testing.T, recorder BatchRecorder) (*API, *putRecorder) {
+	t.Helper()
+
+	stored := &putRecorder{}
+	return &API{
+		alerts:        stored,
+		batchRecorder: recorder,
+		logger:        promslog.NewNopLogger(),
+		m:             metrics.NewAlerts(prometheus.NewRegistry()),
+		alertmanagerConfig: &config.Config{
+			Global: &config.GlobalConfig{ResolveTimeout: model.Duration(5 * time.Minute)},
+		},
+	}, stored
+}
+
+func onePostableAlert() open_api_models.PostableAlerts {
+	now := time.Now()
+	return open_api_models.PostableAlerts{{
+		Alert: open_api_models.Alert{
+			Labels: open_api_models.LabelSet{"alertname": "test", "instance": "1"},
+		},
+		StartsAt: strfmt.DateTime(now),
+		EndsAt:   strfmt.DateTime(now.Add(time.Hour)),
+	}}
+}
+
+func postAlertsWithHeaders(t *testing.T, api *API, postable open_api_models.PostableAlerts, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	r, err := http.NewRequest(http.MethodPost, "/api/v2/alerts", nil)
+	require.NoError(t, err)
+	for k, v := range headers {
+		r.Header.Set(k, v)
+	}
+	w := httptest.NewRecorder()
+	api.postAlertsHandler(alert_ops.PostAlertsParams{HTTPRequest: r, Alerts: postable}).WriteResponse(w, runtime.TextProducer())
+	return w
+}
+
+func batchHeaders(batchID string, sequence uint64) map[string]string {
+	return map[string]string{
+		HeaderSourceID:      "source-a",
+		HeaderBatchID:       batchID,
+		HeaderBatchSequence: strconv.FormatUint(sequence, 10),
+	}
+}
+
+// TestPostAlertsWithoutIdempotencyHeadersKeepsLegacySemantics checks that a
+// recorder being configured does not change requests without identifier
+// headers.
+func TestPostAlertsWithoutIdempotencyHeadersKeepsLegacySemantics(t *testing.T) {
+	t.Parallel()
+
+	recorder, err := idempotency.New(idempotency.Options{
+		SnapshotFile: filepath.Join(t.TempDir(), "idempotency"),
+		Retention:    time.Hour,
+		Logger:       promslog.NewNopLogger(),
+		Metrics:      prometheus.NewRegistry(),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, recorder.Close()) })
+
+	api, stored := newIdempotencyTestAPI(t, recorder)
+	w := postAlertsWithHeaders(t, api, onePostableAlert(), nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Len(t, stored.stored, 1)
+}
+
+// TestPostAlertsDuplicateBatchIsNotReDriven checks that retrying the same
+// batch returns 200 but drives the alert provider exactly once, including
+// after the recorder is rebuilt from its event log (process restart).
+func TestPostAlertsDuplicateBatchIsNotReDriven(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "idempotency")
+	newRecorder := func() *idempotency.Recorder {
+		r, err := idempotency.New(idempotency.Options{
+			SnapshotFile: path,
+			Retention:    time.Hour,
+			Logger:       promslog.NewNopLogger(),
+			Metrics:      prometheus.NewRegistry(),
+		})
+		require.NoError(t, err)
+		return r
+	}
+
+	recorder := newRecorder()
+	api, stored := newIdempotencyTestAPI(t, recorder)
+
+	w := postAlertsWithHeaders(t, api, onePostableAlert(), batchHeaders("batch-1", 1))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Len(t, stored.stored, 1)
+
+	// Immediate retry after a client-side timeout: no second Put.
+	w = postAlertsWithHeaders(t, api, onePostableAlert(), batchHeaders("batch-1", 1))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Len(t, stored.stored, 1)
+
+	// Simulate a restart: the durable records keep protecting the batch.
+	require.NoError(t, recorder.Close())
+	restarted := newRecorder()
+	t.Cleanup(func() { require.NoError(t, restarted.Close()) })
+	api.batchRecorder = restarted
+
+	w = postAlertsWithHeaders(t, api, onePostableAlert(), batchHeaders("batch-1", 1))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Len(t, stored.stored, 1)
+
+	// A new, higher sequence is ingested normally.
+	w = postAlertsWithHeaders(t, api, onePostableAlert(), batchHeaders("batch-2", 2))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Len(t, stored.stored, 2)
+}
+
+// TestPostAlertsIncompleteIdentifierIsRejected covers partial headers and
+// unparsable sequences: the provider must never be touched.
+func TestPostAlertsIncompleteIdentifierIsRejected(t *testing.T) {
+	t.Parallel()
+
+	recorder, err := idempotency.New(idempotency.Options{
+		SnapshotFile: "",
+		Retention:    time.Hour,
+		Logger:       promslog.NewNopLogger(),
+		Metrics:      prometheus.NewRegistry(),
+	})
+	require.NoError(t, err)
+
+	api, stored := newIdempotencyTestAPI(t, recorder)
+
+	for _, headers := range []map[string]string{
+		{HeaderSourceID: "source-a"},
+		{HeaderBatchID: "batch-1"},
+		{HeaderSourceID: "source-a", HeaderBatchID: "batch-1"},
+		{HeaderSourceID: "source-a", HeaderBatchID: "batch-1", HeaderBatchSequence: "not-a-number"},
+	} {
+		w := postAlertsWithHeaders(t, api, onePostableAlert(), headers)
+		require.Equal(t, http.StatusBadRequest, w.Code, "headers: %v", headers)
+		require.Contains(t, w.Body.String(), "incomplete batch identifier")
+		require.Empty(t, stored.stored)
+	}
+}
+
+// TestPostAlertsStaleBatchIsRejected verifies that an older batch cannot
+// overwrite newer state for the same source.
+func TestPostAlertsStaleBatchIsRejected(t *testing.T) {
+	t.Parallel()
+
+	recorder, err := idempotency.New(idempotency.Options{
+		SnapshotFile: "",
+		Retention:    time.Hour,
+		Logger:       promslog.NewNopLogger(),
+		Metrics:      prometheus.NewRegistry(),
+	})
+	require.NoError(t, err)
+
+	api, stored := newIdempotencyTestAPI(t, recorder)
+
+	w := postAlertsWithHeaders(t, api, onePostableAlert(), batchHeaders("batch-1", 10))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Len(t, stored.stored, 1)
+
+	// Same sequence under a different batch id is a stale batch.
+	w = postAlertsWithHeaders(t, api, onePostableAlert(), batchHeaders("batch-old", 10))
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), "stale batch")
+	require.Len(t, stored.stored, 1)
+
+	// A lower sequence is stale as well.
+	w = postAlertsWithHeaders(t, api, onePostableAlert(), batchHeaders("batch-old", 9))
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), "stale batch")
+	require.Len(t, stored.stored, 1)
+}
+
+// TestPostAlertsIncompleteBatchStateIsRejected reproduces a crash between
+// Begin and Complete: the pending record makes the retry fail loudly instead
+// of re-driving the alerts.
+func TestPostAlertsIncompleteBatchStateIsRejected(t *testing.T) {
+	t.Parallel()
+
+	recorder, err := idempotency.New(idempotency.Options{
+		SnapshotFile: "",
+		Retention:    time.Hour,
+		Logger:       promslog.NewNopLogger(),
+		Metrics:      prometheus.NewRegistry(),
+	})
+	require.NoError(t, err)
+
+	outcome, err := recorder.Begin(t.Context(), "source-a", "batch-1", 1)
+	require.NoError(t, err)
+	require.Equal(t, idempotency.OutcomeAccepted, outcome)
+
+	api, stored := newIdempotencyTestAPI(t, recorder)
+	w := postAlertsWithHeaders(t, api, onePostableAlert(), batchHeaders("batch-1", 1))
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), "incomplete batch state")
+	require.Empty(t, stored.stored)
+}
+
+// TestPostAlertsRecorderFailuresAreMappedToStatusCodes checks that
+// persistence failures surface as recognizable 500 responses while client
+// rejections stay 400, and that Complete failures are reported too.
+func TestPostAlertsRecorderFailuresAreMappedToStatusCodes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("begin persistence failure", func(t *testing.T) {
+		t.Parallel()
+
+		failing := &fakeBatchRecorder{beginErr: errors.New("disk on fire")}
+		api, stored := newIdempotencyTestAPI(t, failing)
+		w := postAlertsWithHeaders(t, api, onePostableAlert(), batchHeaders("batch-1", 1))
+		require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+		require.Contains(t, w.Body.String(), "idempotency")
+		require.Empty(t, stored.stored)
+	})
+
+	t.Run("complete persistence failure", func(t *testing.T) {
+		t.Parallel()
+
+		failing := &fakeBatchRecorder{
+			beginOutcome: idempotency.OutcomeAccepted,
+			completeErr:  errors.New("disk on fire"),
+		}
+		api, stored := newIdempotencyTestAPI(t, failing)
+		w := postAlertsWithHeaders(t, api, onePostableAlert(), batchHeaders("batch-1", 1))
+		require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+		require.Contains(t, w.Body.String(), "idempotency")
+		require.Len(t, stored.stored, 1)
+	})
+
+	t.Run("client rejection stays a bad request", func(t *testing.T) {
+		t.Parallel()
+
+		failing := &fakeBatchRecorder{beginErr: fmt.Errorf("wrapped: %w", idempotency.ErrStaleBatch)}
+		api, stored := newIdempotencyTestAPI(t, failing)
+		w := postAlertsWithHeaders(t, api, onePostableAlert(), batchHeaders("batch-1", 1))
+		require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		require.Empty(t, stored.stored)
+	})
+}
+
+// TestParseBatchIdentifier covers the all-or-nothing header contract.
+func TestParseBatchIdentifier(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no headers disables idempotency", func(t *testing.T) {
+		t.Parallel()
+
+		r, err := http.NewRequest(http.MethodPost, "/api/v2/alerts", nil)
+		require.NoError(t, err)
+		id, enabled, err := parseBatchIdentifier(r)
+		require.NoError(t, err)
+		require.False(t, enabled)
+		require.Equal(t, batchIdentifier{}, id)
+	})
+
+	t.Run("all headers are parsed", func(t *testing.T) {
+		t.Parallel()
+
+		r, err := http.NewRequest(http.MethodPost, "/api/v2/alerts", nil)
+		require.NoError(t, err)
+		r.Header.Set(HeaderSourceID, "source-a")
+		r.Header.Set(HeaderBatchID, "batch-1")
+		r.Header.Set(HeaderBatchSequence, "42")
+		id, enabled, err := parseBatchIdentifier(r)
+		require.NoError(t, err)
+		require.True(t, enabled)
+		require.Equal(t, "source-a", id.source)
+		require.Equal(t, "batch-1", id.batchID)
+		require.Equal(t, uint64(42), id.sequence)
+	})
 }
